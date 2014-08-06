@@ -91,6 +91,7 @@ static int ACTUAL_BUF_LENGTH;
 static int *atan_lut = NULL;
 static int atan_lut_size = 131072; /* 512 KB */
 static int atan_lut_coef = 8;
+static int print_deviation = 0;
 
 struct dongle_state
 {
@@ -205,6 +206,7 @@ void usage(void)
 		"\t    deemp:  enable de-emphasis filter\n"
 		"\t    direct: enable direct sampling\n"
 		"\t    offset: enable offset tuning\n"
+		"\t[-D] Print FM deviation\n"
 		"\tfilename ('-' means stdout)\n"
 		"\t    omitting the filename also uses stdout\n\n"
 		"Experimental options:\n"
@@ -426,10 +428,24 @@ void multiply(int ar, int aj, int br, int bj, int *cr, int *cj)
 
 int polar_discriminant(int ar, int aj, int br, int bj)
 {
+#if 0
+	int i=ar;
+	int q=aj;
+	int iold=br;
+	int qold=bj;
+	int denominator = i*iold + q*qold;
+	double angle = 0.0;
+	if (denominator != 0) {
+		double numerator = q*iold - i*qold;
+		angle = atan(numerator/denominator);
+		fprintf(stderr, "angle=%d\n", denominator);
+	}
+#else
 	int cr, cj;
 	double angle;
 	multiply(ar, aj, br, -bj, &cr, &cj);
 	angle = atan2((double)cj, (double)cr);
+#endif
 	return (int)(angle / 3.14159 * (1<<14));
 }
 
@@ -727,6 +743,24 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
+void print_fm_deviation(struct demod_state *fm)
+{
+	int16_t samp_min = INT16_MAX;
+	int16_t samp_max = INT16_MIN;
+	float dev;
+	int i;
+	for (i = 0; i < fm->result_len; ++i) {
+		if (fm->result[i] > samp_max) {
+			samp_max = fm->result[i];
+		} else if (fm->result[i] < samp_min) {
+			samp_min = fm->result[i];
+		}
+	}
+	dev = ((float)samp_max - samp_min) / 2.0f;
+	dev = fm->rate_in * dev / (1 << 15);
+	fprintf(stderr, "len=%d deviation=%fHz\n", fm->result_len, dev);
+}
+
 void full_demod(struct demod_state *d)
 {
 	int i, ds_p;
@@ -763,6 +797,12 @@ void full_demod(struct demod_state *d)
 	if (d->mode_demod == &raw_demod) {
 		return;
 	}
+
+	if (print_deviation)
+	{
+		print_fm_deviation(d);
+	}
+
 	/* todo, fm noise squelch */
 	// use nicer filter here too?
 	if (d->post_downsample > 1) {
@@ -866,12 +906,14 @@ static void optimal_settings(int freq, int rate)
 	capture_rate = dm->downsample * dm->rate_in;
 	if (!d->offset_tuning) {
 		capture_freq = freq + capture_rate/4;}
+	fprintf(stderr, "capture_freq=%u\n", capture_freq);
 	capture_freq += cs->edge * dm->rate_in / 2;
 	dm->output_scale = (1<<15) / (128 * dm->downsample);
 	if (dm->output_scale < 1) {
 		dm->output_scale = 1;}
 	if (dm->mode_demod == &fm_demod) {
 		dm->output_scale = 1;}
+	fprintf(stderr, "capture_freq=%u\n", capture_freq);
 	d->freq = (uint32_t)capture_freq;
 	d->rate = (uint32_t)capture_rate;
 }
@@ -896,6 +938,7 @@ static void *controller_thread_fn(void *arg)
 		verbose_offset_tuning(dongle.dev);}
 
 	/* Set the frequency */
+	fprintf(stderr, "Center frequency: %u\n", dongle.freq);
 	verbose_set_frequency(dongle.dev, dongle.freq);
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod.downsample);
 	fprintf(stderr, "Oversampling output by: %ix.\n", demod.post_downsample);
@@ -903,6 +946,7 @@ static void *controller_thread_fn(void *arg)
 		1000 * 0.5 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
 
 	/* Set the sample rate */
+	fprintf(stderr, "dongle.rate=%d\n", dongle.rate);
 	verbose_set_sample_rate(dongle.dev, dongle.rate);
 	fprintf(stderr, "Output at %u Hz.\n", demod.rate_in/demod.post_downsample);
 
@@ -1047,7 +1091,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:Dh")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1105,6 +1149,7 @@ int main(int argc, char **argv)
 			if (strcmp("direct",  optarg) == 0) {
 				dongle.direct_sampling = 1;}
 			if (strcmp("offset",  optarg) == 0) {
+				fprintf(stderr, "### Using offset tuning!\n");
 				dongle.offset_tuning = 1;}
 			break;
 		case 'F':
@@ -1141,6 +1186,9 @@ int main(int argc, char **argv)
 				//demod.post_downsample = 4;
 				demod.deemph = 1;
 				demod.squelch_level = 0;}
+			break;
+		case 'D':
+			print_deviation = 1;
 			break;
 		case 'h':
 		default:
