@@ -150,6 +150,9 @@ struct demod_state
 	pthread_cond_t ready;
 	pthread_mutex_t ready_m;
 	struct output_state *output_target;
+	double   cal_sum;
+	int      cal_cnt;
+	int      calibrate;
 	struct goertzel goertzel;
 	int	 print_dev_blocksize;
 	int	 print_dev_subblocksize;
@@ -211,6 +214,17 @@ void usage(void)
 		//"\t    for fm squelch is inverted\n"
 		//"\t[-o oversampling (default: 1, 4 recommended)]\n"
 		"\t[-p ppm_error (default: 0)]\n"
+		"\t[-c] Do frequency error calibration\n"
+		"\t    Frequency error calibration will only work for FM.\n"
+		"\t    Use a higher sample rate, like -s170k, to handle\n"
+		"\t    large frequency errors. A strong and noise free\n"
+		"\t    signal is needed for good results. For example, use a\n"
+		"\t    broadcast FM station for calibration. Let the\n"
+		"\t    calibration run for some minutes until the values\n"
+		"\t    have stabilized. Rerun with -p option using the\n"
+		"\t    suggested ppm_error. Try this on a couple of stations.\n"
+		"\t    Repeat until the error is stable at about zero.\n"
+		"\t    Example: rtl_fm -f99.3M -s170k -r48k -c - | aplay -r48k -fS16_LE -\n"
 		"\t[-E enable_option (default: none)]\n"
 		"\t    use multiple -E to enable multiple options\n"
 		"\t    edge:   enable lower edge tuning\n"
@@ -761,6 +775,27 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
+void calc_fm_fq_offset(struct demod_state *fm)
+{
+	int i;
+	for (i=0; i<fm->result_len; ++i)
+	{
+		/* Correct demodulated FM using rate_in * pcm / 2 and remove 
+		 * integer multiplier */
+		fm->cal_sum += fm->rate_in * (double)fm->result[i] / (1 << 15);
+		if (++fm->cal_cnt >= fm->rate_in)
+		{
+			double fq_offset = fm->cal_sum / fm->cal_cnt;
+			double fq_corr = -1000000.0 * fq_offset / dongle.freq;
+			int ppm_error = (int)round(fq_corr);
+			fprintf(stderr, "fq_offset=%+.0fHz ppm_error=%+d\n",
+					fq_offset, ppm_error);
+			fm->cal_sum = 0.0;
+			fm->cal_cnt = 0;
+		}
+	}
+}
+
 void print_fm_deviation_tone(struct demod_state *fm)
 {
 	int i;
@@ -834,6 +869,11 @@ void full_demod(struct demod_state *d)
 	d->mode_demod(d);  /* lowpassed -> result */
 	if (d->mode_demod == &raw_demod) {
 		return;
+	}
+
+	if (d->calibrate)
+	{
+		calc_fm_fq_offset(d);
 	}
 
 	if (d->print_dev != NULL)
@@ -1061,13 +1101,15 @@ void demod_init(struct demod_state *s)
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
 	s->output_target = &output;
+	s->cal_sum = 0.0;
+	s->cal_cnt = 0;
+	s->calibrate = 0;
 	s->print_dev_blocksize = 0;
 	s->print_dev_subblocksize = 0;
 	s->print_dev_cnt = 0;
 	s->print_dev_subcnt = 0;
 	s->print_dev_value = 0.0;
 	s->print_dev = NULL;
-
 }
 
 void demod_cleanup(struct demod_state *s)
@@ -1141,7 +1183,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:D::h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:D::ch")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1237,6 +1279,8 @@ int main(int argc, char **argv)
 				demod.deemph = 1;
 				demod.squelch_level = 0;}
 			break;
+		case 'c':
+			demod.calibrate = 1;
 		case 'D':
 			demod.print_dev_blocksize = demod.rate_in / PRINT_DEV_RATE;
 			if (optarg != NULL) {
@@ -1248,6 +1292,13 @@ int main(int argc, char **argv)
 			usage();
 			break;
 		}
+	}
+
+	if (demod.calibrate && demod.mode_demod != &fm_demod)
+	{
+		fprintf(stderr, "Error: Frequency calibration can only "
+				"be done using the FM demodulator\n");
+		exit(1);
 	}
 
 	/* quadruple sample_rate to limit to Δθ to ±π/2 */
