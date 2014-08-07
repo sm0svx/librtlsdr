@@ -74,6 +74,7 @@
 
 #include "rtl-sdr.h"
 #include "convenience/convenience.h"
+#include "goertzel.h"
 
 #define DEFAULT_SAMPLE_RATE		24000
 #define DEFAULT_BUF_LENGTH		(1 * 16384)
@@ -84,6 +85,11 @@
 
 #define FREQUENCIES_LIMIT		1000
 
+#define PRINT_DEV_ALPHA			0.9	/* IIR filter coefficient */
+#define PRINT_DEV_RATE			10	/* Times/s print rate */
+#define PRINT_DEV_GOERTZEL_BW		100	/* Tone filter bw in Hz */
+#define PRINT_DEV_WB_BW			50	/* Min freq in wideband mode */
+
 static volatile int do_exit = 0;
 static int lcm_post[17] = {1,1,1,3,1,5,3,7,1,9,5,11,3,13,7,15,1};
 static int ACTUAL_BUF_LENGTH;
@@ -91,7 +97,6 @@ static int ACTUAL_BUF_LENGTH;
 static int *atan_lut = NULL;
 static int atan_lut_size = 131072; /* 512 KB */
 static int atan_lut_coef = 8;
-static int print_deviation = 0;
 
 struct dongle_state
 {
@@ -145,6 +150,13 @@ struct demod_state
 	pthread_cond_t ready;
 	pthread_mutex_t ready_m;
 	struct output_state *output_target;
+	struct goertzel goertzel;
+	int	 print_dev_blocksize;
+	int	 print_dev_subblocksize;
+	int	 print_dev_cnt;
+	int	 print_dev_subcnt;
+	double   print_dev_value;
+	void     (*print_dev)(struct demod_state*);
 };
 
 struct output_state
@@ -206,7 +218,13 @@ void usage(void)
 		"\t    deemp:  enable de-emphasis filter\n"
 		"\t    direct: enable direct sampling\n"
 		"\t    offset: enable offset tuning\n"
-		"\t[-D] Print FM deviation\n"
+		"\t[-D [tone freq]] Print the deviation of an FM signal.\n"
+		"\t    If given without a tone frequency, the whole bandwidth\n"
+		"\t    is used in the measurement. This include a lot of noise on\n"
+		"\t    weak signals so the measurement will not be so good.\n"
+		"\t    If a deviation measurement is done on a single tone the\n"
+		"\t    tone frequency should be given to improve the accuracy\n"
+		"\t    of the estimate.\n"
 		"\tfilename ('-' means stdout)\n"
 		"\t    omitting the filename also uses stdout\n\n"
 		"Experimental options:\n"
@@ -743,7 +761,23 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
-void print_fm_deviation(struct demod_state *fm)
+void print_fm_deviation_tone(struct demod_state *fm)
+{
+	int i;
+	for (i = 0; i < fm->result_len; ++i) {
+		goertzel_calc(&fm->goertzel, fm->result[i]);
+		if (++fm->print_dev_subcnt == fm->print_dev_subblocksize) {
+			double dev = goertzel_mag_sqr(&fm->goertzel);
+			dev = 2.0 * sqrt(dev) / fm->print_dev_subblocksize;
+			fm->print_dev_value = (1.0-PRINT_DEV_ALPHA)*dev +
+			       	PRINT_DEV_ALPHA*fm->print_dev_value;
+			goertzel_reset(&fm->goertzel);
+			fm->print_dev_subcnt = 0;
+		}
+	}
+}
+
+void print_fm_deviation_wb(struct demod_state *fm)
 {
 	int16_t samp_min = INT16_MAX;
 	int16_t samp_max = INT16_MIN;
@@ -755,10 +789,14 @@ void print_fm_deviation(struct demod_state *fm)
 		} else if (fm->result[i] < samp_min) {
 			samp_min = fm->result[i];
 		}
+		if (++fm->print_dev_subcnt == fm->print_dev_subblocksize) {
+			float dev = ((float)samp_max - samp_min) / 2.0f;
+			dev = fm->rate_in * dev / (1 << 15);
+			fm->print_dev_value = (1.0-PRINT_DEV_ALPHA)*dev +
+			       	PRINT_DEV_ALPHA*fm->print_dev_value;
+			fm->print_dev_subcnt = 0;
+		}
 	}
-	dev = ((float)samp_max - samp_min) / 2.0f;
-	dev = fm->rate_in * dev / (1 << 15);
-	fprintf(stderr, "len=%d deviation=%fHz\n", fm->result_len, dev);
 }
 
 void full_demod(struct demod_state *d)
@@ -798,9 +836,13 @@ void full_demod(struct demod_state *d)
 		return;
 	}
 
-	if (print_deviation)
+	if (d->print_dev != NULL)
 	{
-		print_fm_deviation(d);
+		d->print_dev(d);
+		d->print_dev_cnt += d->result_len;
+		if (d->print_dev_cnt >= d->print_dev_blocksize) {
+			fprintf(stderr, "Deviation: %f\n", d->print_dev_value);
+		}
 	}
 
 	/* todo, fm noise squelch */
@@ -1019,6 +1061,13 @@ void demod_init(struct demod_state *s)
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
 	s->output_target = &output;
+	s->print_dev_blocksize = 0;
+	s->print_dev_subblocksize = 0;
+	s->print_dev_cnt = 0;
+	s->print_dev_subcnt = 0;
+	s->print_dev_value = 0.0;
+	s->print_dev = NULL;
+
 }
 
 void demod_cleanup(struct demod_state *s)
@@ -1086,12 +1135,13 @@ int main(int argc, char **argv)
 	int r, opt;
 	int dev_given = 0;
 	int custom_ppm = 0;
+	float print_dev_fq = 0.0f;
 	dongle_init(&dongle);
 	demod_init(&demod);
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:Dh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:D::h")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1188,7 +1238,10 @@ int main(int argc, char **argv)
 				demod.squelch_level = 0;}
 			break;
 		case 'D':
-			print_deviation = 1;
+			demod.print_dev_blocksize = demod.rate_in / PRINT_DEV_RATE;
+			if (optarg != NULL) {
+				print_dev_fq = atofs(optarg);
+			}
 			break;
 		case 'h':
 		default:
@@ -1204,6 +1257,22 @@ int main(int argc, char **argv)
 		output.rate = demod.rate_out;}
 
 	sanity_checks();
+
+	if (demod.print_dev_blocksize > 0) {
+		if (demod.mode_demod != &fm_demod) {
+			fprintf(stderr, "*** ERROR: Deviation can only be measured for FM\n");
+			exit(1);
+		}
+		if (print_dev_fq > 0.0f) {
+			goertzel_init(&demod.goertzel, print_dev_fq,
+					demod.rate_in);
+			demod.print_dev_subblocksize = demod.rate_in / PRINT_DEV_GOERTZEL_BW;
+			demod.print_dev = print_fm_deviation_tone;
+		} else {
+			demod.print_dev_subblocksize = demod.rate_in / PRINT_DEV_WB_BW;
+			demod.print_dev = print_fm_deviation_wb;
+		}
+	}
 
 	if (controller.freq_len > 1) {
 		demod.terminate_on_squelch = 0;}
