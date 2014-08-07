@@ -446,24 +446,10 @@ void multiply(int ar, int aj, int br, int bj, int *cr, int *cj)
 
 int polar_discriminant(int ar, int aj, int br, int bj)
 {
-#if 0
-	int i=ar;
-	int q=aj;
-	int iold=br;
-	int qold=bj;
-	int denominator = i*iold + q*qold;
-	double angle = 0.0;
-	if (denominator != 0) {
-		double numerator = q*iold - i*qold;
-		angle = atan(numerator/denominator);
-		fprintf(stderr, "angle=%d\n", denominator);
-	}
-#else
 	int cr, cj;
 	double angle;
 	multiply(ar, aj, br, -bj, &cr, &cj);
 	angle = atan2((double)cj, (double)cr);
-#endif
 	return (int)(angle / 3.14159 * (1<<14));
 }
 
@@ -948,14 +934,12 @@ static void optimal_settings(int freq, int rate)
 	capture_rate = dm->downsample * dm->rate_in;
 	if (!d->offset_tuning) {
 		capture_freq = freq + capture_rate/4;}
-	fprintf(stderr, "capture_freq=%u\n", capture_freq);
 	capture_freq += cs->edge * dm->rate_in / 2;
 	dm->output_scale = (1<<15) / (128 * dm->downsample);
 	if (dm->output_scale < 1) {
 		dm->output_scale = 1;}
 	if (dm->mode_demod == &fm_demod) {
 		dm->output_scale = 1;}
-	fprintf(stderr, "capture_freq=%u\n", capture_freq);
 	d->freq = (uint32_t)capture_freq;
 	d->rate = (uint32_t)capture_rate;
 }
@@ -980,7 +964,6 @@ static void *controller_thread_fn(void *arg)
 		verbose_offset_tuning(dongle.dev);}
 
 	/* Set the frequency */
-	fprintf(stderr, "Center frequency: %u\n", dongle.freq);
 	verbose_set_frequency(dongle.dev, dongle.freq);
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod.downsample);
 	fprintf(stderr, "Oversampling output by: %ix.\n", demod.post_downsample);
@@ -988,7 +971,6 @@ static void *controller_thread_fn(void *arg)
 		1000 * 0.5 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
 
 	/* Set the sample rate */
-	fprintf(stderr, "dongle.rate=%d\n", dongle.rate);
 	verbose_set_sample_rate(dongle.dev, dongle.rate);
 	fprintf(stderr, "Output at %u Hz.\n", demod.rate_in/demod.post_downsample);
 
@@ -1199,7 +1181,6 @@ int main(int argc, char **argv)
 			if (strcmp("direct",  optarg) == 0) {
 				dongle.direct_sampling = 1;}
 			if (strcmp("offset",  optarg) == 0) {
-				fprintf(stderr, "### Using offset tuning!\n");
 				dongle.offset_tuning = 1;}
 			break;
 		case 'F':
@@ -1260,7 +1241,7 @@ int main(int argc, char **argv)
 
 	if (demod.print_dev_blocksize > 0) {
 		if (demod.mode_demod != &fm_demod) {
-			fprintf(stderr, "*** ERROR: Deviation can only be measured for FM\n");
+			fprintf(stderr, "Error: Deviation can only be measured for FM\n");
 			exit(1);
 		}
 		if (print_dev_fq > 0.0f) {
