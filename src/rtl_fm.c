@@ -1262,6 +1262,7 @@ int main(int argc, char **argv)
 			break;
 		case 'c':
 			demod.calibrate = 1;
+			break;
 		case 'D':
 			demod.print_dev_blocksize = demod.rate_in / PRINT_DEV_RATE;
 			if (optarg != NULL) {
