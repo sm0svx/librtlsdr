@@ -828,6 +828,7 @@ void full_demod(struct demod_state *d)
 		d->print_dev_cnt += d->result_len;
 		if (d->print_dev_cnt >= d->print_dev_blocksize) {
 			fprintf(stderr, "Deviation: %f\n", d->print_dev_value);
+			d->print_dev_cnt = 0;
 		}
 	}
 
