@@ -85,9 +85,9 @@
 
 #define FREQUENCIES_LIMIT		1000
 
-#define PRINT_DEV_ALPHA			0.9	/* IIR filter coefficient */
-#define PRINT_DEV_RATE			10	/* Times/s print rate */
-#define PRINT_DEV_GOERTZEL_BW		100	/* Tone filter bw in Hz */
+#define PRINT_DEV_ALPHA			0.8	/* IIR filter coefficient */
+#define PRINT_DEV_RATE			4	/* Times/s print rate */
+#define PRINT_DEV_GOERTZEL_BW		20	/* Tone filter bw in Hz */
 #define PRINT_DEV_WB_BW			50	/* Min freq in wideband mode */
 
 static volatile int do_exit = 0;
@@ -159,6 +159,8 @@ struct demod_state
 	int	 print_dev_cnt;
 	int	 print_dev_subcnt;
 	double   print_dev_value;
+	double   print_dev_adjust;
+	double   *print_dev_win;
 	void     (*print_dev)(struct demod_state*);
 };
 
@@ -782,14 +784,44 @@ void calc_fm_fq_offset(struct demod_state *fm)
 	}
 }
 
+double *flat_top_window(unsigned N)
+{
+	static const double a0 = 0.21557895;
+	static const double a1 = 0.41663158;
+	static const double a2 = 0.277263158;
+	static const double a3 = 0.083578947;
+	static const double a4 = 0.006947368;
+	double mean = 0.0;
+	unsigned n;
+	double *win = malloc(N * sizeof(*win));
+	for (n=0; n<N; ++n)
+	{
+		win[n] = a0
+		       - a1 * cos(2*M_PI*n / (N-1))
+		       + a2 * cos(4*M_PI*n / (N-1))
+		       - a3 * cos(6*M_PI*n / (N-1))
+		       + a4 * cos(8*M_PI*n / (N-1));
+		mean += win[n];
+	}
+	mean /= N;
+	for (n=0; n<N; ++n)
+	{
+		win[n] /= mean;
+	}
+	return win;
+}
+
 void print_fm_deviation_tone(struct demod_state *fm)
 {
 	int i;
 	for (i = 0; i < fm->result_len; ++i) {
-		goertzel_calc(&fm->goertzel, fm->result[i]);
+		double samp = fm->rate_in * (double)fm->result[i] / (1 << 15);
+		samp *= fm->print_dev_win[fm->print_dev_subcnt];
+		goertzel_calc(&fm->goertzel, samp);
 		if (++fm->print_dev_subcnt == fm->print_dev_subblocksize) {
 			double dev = goertzel_mag_sqr(&fm->goertzel);
 			dev = 2.0 * sqrt(dev) / fm->print_dev_subblocksize;
+			dev *= fm->print_dev_adjust;
 			fm->print_dev_value = (1.0-PRINT_DEV_ALPHA)*dev +
 			       	PRINT_DEV_ALPHA*fm->print_dev_value;
 			goertzel_reset(&fm->goertzel);
@@ -868,6 +900,7 @@ void full_demod(struct demod_state *d)
 		d->print_dev_cnt += d->result_len;
 		if (d->print_dev_cnt >= d->print_dev_blocksize) {
 			fprintf(stderr, "Deviation: %f\n", d->print_dev_value);
+			d->print_dev_cnt = 0;
 		}
 	}
 
@@ -1091,6 +1124,8 @@ void demod_init(struct demod_state *s)
 	s->print_dev_cnt = 0;
 	s->print_dev_subcnt = 0;
 	s->print_dev_value = 0.0;
+	s->print_dev_adjust = 1.0;
+	s->print_dev_win = NULL;
 	s->print_dev = NULL;
 }
 
@@ -1297,9 +1332,21 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 		if (print_dev_fq > 0.0f) {
+			/* Calculate an adjustment factor that is used to correct the
+			 * measured deviation. Without adjustment, the measured deviation
+			 * will be lower than expected due to the limited passband.
+			 * FM modulation has infinite bandwidth so if the signal is
+			 * filtered, some power will be lost.
+			 * The adjustment polynom has been determined empirically. */
+			double norm_fq = print_dev_fq / demod.rate_in;
+			demod.print_dev_adjust = 21.936 * norm_fq * norm_fq * norm_fq
+					       - 1.6502 * norm_fq * norm_fq
+					       + 0.11725 * norm_fq
+					       + 0.99975;
 			goertzel_init(&demod.goertzel, print_dev_fq,
 					demod.rate_in);
 			demod.print_dev_subblocksize = demod.rate_in / PRINT_DEV_GOERTZEL_BW;
+			demod.print_dev_win = flat_top_window(demod.print_dev_subblocksize);
 			demod.print_dev = print_fm_deviation_tone;
 		} else {
 			demod.print_dev_subblocksize = demod.rate_in / PRINT_DEV_WB_BW;
